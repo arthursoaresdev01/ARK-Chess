@@ -1,0 +1,29 @@
+# Ambiente virtual
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Modelos e treinamentos
+runs/
+
+# Datasets
+dataset_pecas/
+dataset_final/
+
+# Capturas temporárias
+casas/
+tabuleiro_atual.png
+tabuleiro2.png
+
+# Stockfish local
+stockfish-windows-x86-64-avx2/
+
+# IDE / sistema
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
