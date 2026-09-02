@@ -1,4 +1,5 @@
-﻿# ♟️ ARK Chess
+
+# ♟️ ARK Chess
 
 ARK Chess é um projeto em Python para estudo e treinamento de xadrez, utilizando visão computacional, reconhecimento de peças e análise de posições com Stockfish.
 

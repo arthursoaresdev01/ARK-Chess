@@ -27,3 +27,5 @@ stockfish-windows-x86-64-avx2/
 .idea/
 .DS_Store
 Thumbs.db
+ark_chess.log
+diagnosticos_v25/
