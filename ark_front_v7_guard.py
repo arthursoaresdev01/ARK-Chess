@@ -12,7 +12,10 @@ from PySide6.QtWidgets import (
     QMainWindow, QPushButton, QTextEdit, QVBoxLayout, QWidget
 )
 
-BACKEND = Path(__file__).with_name("testar_captura_v26.py")
+# pyrefly: ignore [missing-import]
+from ark_overlay_v3 import ArkOverlay
+
+BACKEND = Path(__file__).with_name("testar_captura_v29_guard.py")
 
 
 class ArkCard(QFrame):
@@ -29,7 +32,9 @@ class ArkChessWindow(QMainWindow):
         self.esperando_melhor_jogada = False
         self.expandido = False
 
-        # Mantém o ARK visível quando você clica no Chess.com.
+        # Overlay independente e click-through.
+        self.overlay = ArkOverlay()
+
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
 
         self.setWindowTitle("ARK Chess")
@@ -39,8 +44,6 @@ class ArkChessWindow(QMainWindow):
 
         self.aplicar_estilo()
         self.montar_interface()
-
-        # Começa no lado direito da tela para não cobrir o board.
         self.auto_posicionar()
 
     def aplicar_estilo(self):
@@ -118,7 +121,6 @@ class ArkChessWindow(QMainWindow):
         logo = QLabel("♟ ARK CHESS")
         logo.setFont(QFont("Segoe UI", 18, QFont.Bold))
         tl.addWidget(logo)
-
         tl.addStretch()
 
         self.status_sidebar = QLabel("● OFFLINE")
@@ -154,7 +156,6 @@ class ArkChessWindow(QMainWindow):
         el.addWidget(turno_txt)
 
         self.combo_turno = QComboBox()
-        self.combo_turno.addItem("Automático", "auto")
         self.combo_turno.addItem("Minha vez agora", "minha")
         self.combo_turno.addItem("Vez do bot agora", "bot")
         el.addWidget(self.combo_turno)
@@ -203,8 +204,9 @@ class ArkChessWindow(QMainWindow):
 
         self.log = QTextEdit()
         self.log.setReadOnly(True)
-        self.log.append("ARK Front V3 pronto.")
-        self.log.append("Backend esperado: testar_captura_v26.py")
+        self.log.append("ARK Front V7 Guard pronto.")
+        self.log.append("Backend: testar_captura_v29_guard.py")
+        self.log.append("Overlay V3: anti-captura")
         ll.addWidget(self.log)
 
         body.addWidget(self.log_card, 1)
@@ -215,11 +217,9 @@ class ArkChessWindow(QMainWindow):
             return
 
         area = tela.availableGeometry()
-
         margem = 12
         x = area.x() + area.width() - self.width() - margem
         y = area.y() + margem
-
         self.move(max(area.x(), x), y)
 
     def alternar_tamanho(self):
@@ -257,6 +257,7 @@ class ArkChessWindow(QMainWindow):
             self.status_engine.setText("Backend V26 não encontrado")
             return
 
+        self.overlay.clear_move()
         self.lbl_jogada.setText("—")
         self.lbl_cor.setText("Sua cor: —")
         self.lbl_turno.setText("Vez: —")
@@ -281,13 +282,15 @@ class ArkChessWindow(QMainWindow):
 
         self.combo_turno.setEnabled(False)
         self.btn_start.setText("■  PARAR ARK")
-        self.status_engine.setText("Iniciando backend V26...")
+        self.status_engine.setText("Iniciando backend V29 Guard...")
         self.mudar_status(True)
         self.log.append(
-            f"Iniciando ARK V26 • turno inicial: {opcao_turno}"
+            f"Iniciando ARK V29 Guard • turno inicial: {opcao_turno}"
         )
 
     def parar_ark(self):
+        self.overlay.clear_move()
+
         if not self.processo:
             return
 
@@ -298,6 +301,8 @@ class ArkChessWindow(QMainWindow):
             self.processo.kill()
 
     def backend_finalizado(self, exit_code, _status):
+        self.overlay.clear_move()
+
         self.btn_start.setText("▶  INICIAR ARK")
         self.combo_turno.setEnabled(True)
         self.status_engine.setText(f"ARK parado • código {exit_code}")
@@ -323,10 +328,31 @@ class ArkChessWindow(QMainWindow):
         if not re.fullmatch(r"[rnbqkpRNBQKP\.\s]+", linha):
             self.log.append(linha)
 
+        # V26 informa a região real do board.
+        # Exemplo:
+        # Região real: {'left': 390, 'top': 147, 'width': 816, 'height': 816}
+        if "Região real:" in linha:
+            m = re.search(
+                r"'left':\s*(\d+).*?'top':\s*(\d+).*?"
+                r"'width':\s*(\d+).*?'height':\s*(\d+)",
+                linha,
+            )
+            if m:
+                left, top, width, height = map(int, m.groups())
+                size = min(width, height)
+                self.overlay.set_board_geometry(left, top, size)
+                self.log.append(
+                    f"Overlay alinhado: {left},{top} • {size}x{size}"
+                )
+
         if "Sua cor:" in linha:
             m = re.search(r"Sua cor:\s*(Brancas|Pretas)", linha, re.I)
             if m:
-                self.lbl_cor.setText(f"Sua cor: {m.group(1)}")
+                cor = m.group(1)
+                self.lbl_cor.setText(f"Sua cor: {cor}")
+                self.overlay.set_orientation(
+                    white_at_bottom=cor.lower() == "brancas"
+                )
 
         if linha.startswith("Vez:"):
             turno = linha.split(":", 1)[1].strip()
@@ -334,19 +360,27 @@ class ArkChessWindow(QMainWindow):
 
         if "SUA VEZ" in linha:
             self.lbl_estado.setText("Estado: sua vez")
+
         elif "Aguardando jogada do adversário" in linha:
             self.lbl_estado.setText("Estado: aguardando bot")
+            self.overlay.clear_move()
+
         elif "ARK CHESS ATIVO" in linha:
             self.status_engine.setText("Sistema ativo")
             self.lbl_estado.setText("Estado: monitorando")
+
         elif "Procurando posição válida" in linha:
             self.status_engine.setText("Procurando tabuleiro...")
+
         elif "Tabuleiro reconhecido e confirmado" in linha:
             self.status_engine.setText("Tabuleiro reconhecido")
+
         elif "SINCRONIZAÇÃO RECUPERADA" in linha:
             self.lbl_estado.setText("Estado: sincronização recuperada")
+
         elif "Turno e estado sincronizados" in linha:
             self.lbl_estado.setText("Estado: sincronizado")
+
         elif "recuperou roque visualmente" in linha.lower():
             self.lbl_estado.setText("Estado: roque reconhecido")
 
@@ -355,11 +389,24 @@ class ArkChessWindow(QMainWindow):
             return
 
         if self.esperando_melhor_jogada:
-            if re.search(r"\b[a-h][1-8]\s*->\s*[a-h][1-8]\b", linha):
+            m = re.search(
+                r"\b([a-h][1-8])\s*->\s*([a-h][1-8])\b",
+                linha,
+                re.I,
+            )
+            if m:
+                origem = m.group(1).lower()
+                destino = m.group(2).lower()
+
                 self.lbl_jogada.setText(linha.replace("->", "→"))
+                self.overlay.set_move(origem, destino)
+
                 self.esperando_melhor_jogada = False
 
     def closeEvent(self, event):
+        self.overlay.clear_move()
+        self.overlay.close()
+
         if self.processo and self.processo.state() != QProcess.NotRunning:
             self.processo.kill()
             self.processo.waitForFinished(1000)

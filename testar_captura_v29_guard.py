@@ -43,7 +43,7 @@ from analisar_tabuleiro import (
 # CONFIGURAÇÕES
 # ============================================================
 
-VERSAO = "V26"
+VERSAO = "V29-GUARD"
 
 # Região EXATA da V12 que já funcionou com o classificador.
 MONITOR_FIXO_V12 = {
@@ -60,7 +60,7 @@ MONITOR = MONITOR_FIXO_V12.copy()
 # na geometria que já funcionava na V12.
 AUTO_ACOMPANHAR_JANELA = True
 TITULOS_JANELA_CHESS = ("chess.com", "chess")
-INTERVALO_ATUALIZAR_JANELA = 0.35
+INTERVALO_ATUALIZAR_JANELA = 0.12
 
 # V24: o board real pode ter outro tamanho na tela.
 # A visão interna do ARK recebe SEMPRE 816x816.
@@ -81,26 +81,26 @@ CAMINHO_STOCKFISH = Path(
 ) / "stockfish" / "stockfish-windows-x86-64-avx2.exe"
 
 # Loop
-INTERVALO_LOOP = 0.18
-INTERVALO_RELEITURA_FORCADA = 0.70
+INTERVALO_LOOP = 0.015
+INTERVALO_RELEITURA_FORCADA = 0.80
 
 # Captura estável
-INTERVALO_FRAME_ESTAVEL = 0.16
-MAX_TENTATIVAS_ESTABILIDADE = 6
-LIMITE_PIXELS_ESTABILIDADE = 1400
+INTERVALO_FRAME_ESTAVEL = 0.015
+MAX_TENTATIVAS_ESTABILIDADE = 2
+LIMITE_PIXELS_ESTABILIDADE = 1800
 
 # Detector rápido de mudança visual
 LIMITE_PIXELS_MUDANCA = 3500
 
 # Reconhecimento por consenso
-MAX_TENTATIVAS_RECONHECIMENTO = 5
+MAX_TENTATIVAS_RECONHECIMENTO = 2
 LEITURAS_IGUAIS_NECESSARIAS = 2
-INTERVALO_ENTRE_LEITURAS = 0.15
+INTERVALO_ENTRE_LEITURAS = 0.015
 
 # Modo agressivo: usado quando os pixels dizem que houve mudança,
 # mas o classificador insiste em devolver a posição anterior.
-MAX_TENTATIVAS_RECONHECIMENTO_AGRESSIVO = 10
-INTERVALO_AGRESSIVO = 0.12
+MAX_TENTATIVAS_RECONHECIMENTO_AGRESSIVO = 3
+INTERVALO_AGRESSIVO = 0.015
 
 # Filtros do classificador
 CONFIANCA_MEDIA_MINIMA = 0.52
@@ -109,16 +109,16 @@ CONFIANCA_MEDIA_MINIMA = 0.52
 MAX_PLIES_RECUPERACAO = 3
 MAX_ESTADOS_BFS = 25000
 # V22: não abandona o board confirmado por ruído temporário.
-FALHAS_ATE_RESSINCRONIZAR = 7
-TEMPO_MINIMO_RESSINCRONIZAR = 2.2
+FALHAS_ATE_RESSINCRONIZAR = 4
+TEMPO_MINIMO_RESSINCRONIZAR = 0.75
 
 # Stockfish
-STOCKFISH_TEMPO_ANALISE = 0.85
+STOCKFISH_TEMPO_ANALISE = 0.07
 STOCKFISH_HASH_MB = 256
 STOCKFISH_THREADS_MAX = 4
 
 # Reduz spam no terminal
-INTERVALO_STATUS = 1.5
+INTERVALO_STATUS = 0.70
 
 
 NOMES_PECAS = {
@@ -899,6 +899,234 @@ def capturar_estavel(sct):
     # Em vez de falhar totalmente, devolve o frame mais estável encontrado.
     return melhor
 
+
+
+# ============================================================
+# V28 ULTRA — RASTREAMENTO DE LANCE SEM YOLO
+# ============================================================
+
+def _square_para_tela(square, orientacao):
+    arquivo = chess.square_file(square)
+    rank = chess.square_rank(square)
+
+    if orientacao == "p":
+        linha = rank
+        coluna = 7 - arquivo
+    else:
+        linha = 7 - rank
+        coluna = arquivo
+
+    return linha, coluna
+
+
+def _diferencas_por_casa(imagem_antiga, imagem_nova):
+    """
+    Mede somente a região central de cada casa.
+    Isso reduz bastante hover, bordas e highlights do Chess.com.
+    """
+    if (
+        imagem_antiga is None
+        or imagem_nova is None
+        or imagem_antiga.shape != imagem_nova.shape
+    ):
+        return None
+
+    if imagem_antiga.shape[2] == 4:
+        antiga = cv2.cvtColor(imagem_antiga, cv2.COLOR_BGRA2GRAY)
+        nova = cv2.cvtColor(imagem_nova, cv2.COLOR_BGRA2GRAY)
+    else:
+        antiga = cv2.cvtColor(imagem_antiga, cv2.COLOR_BGR2GRAY)
+        nova = cv2.cvtColor(imagem_nova, cv2.COLOR_BGR2GRAY)
+
+    altura, largura = antiga.shape[:2]
+    ys = np.linspace(0, altura, 9, dtype=int)
+    xs = np.linspace(0, largura, 9, dtype=int)
+
+    valores = {}
+
+    for linha in range(8):
+        for coluna in range(8):
+            y1, y2 = ys[linha], ys[linha + 1]
+            x1, x2 = xs[coluna], xs[coluna + 1]
+
+            h = y2 - y1
+            w = x2 - x1
+
+            # Centro da casa: mantém peça, elimina boa parte de hover/bordas.
+            my = max(2, int(h * 0.16))
+            mx = max(2, int(w * 0.16))
+
+            a = antiga[y1 + my:y2 - my, x1 + mx:x2 - mx]
+            b = nova[y1 + my:y2 - my, x1 + mx:x2 - mx]
+
+            if a.size == 0 or b.size == 0:
+                valores[(linha, coluna)] = 0.0
+                continue
+
+            valores[(linha, coluna)] = float(
+                np.mean(cv2.absdiff(a, b))
+            )
+
+    return valores
+
+
+def _casas_esperadas_lance(board, movimento, orientacao):
+    casas = {
+        _square_para_tela(movimento.from_square, orientacao),
+        _square_para_tela(movimento.to_square, orientacao),
+    }
+
+    if board.is_castling(movimento):
+        if movimento.to_square == chess.G1:
+            extras = (chess.H1, chess.F1)
+        elif movimento.to_square == chess.C1:
+            extras = (chess.A1, chess.D1)
+        elif movimento.to_square == chess.G8:
+            extras = (chess.H8, chess.F8)
+        else:
+            extras = (chess.A8, chess.D8)
+
+        for sq in extras:
+            casas.add(_square_para_tela(sq, orientacao))
+
+    if board.is_en_passant(movimento):
+        capturada = (
+            movimento.to_square - 8
+            if board.turn == chess.WHITE
+            else movimento.to_square + 8
+        )
+        casas.add(_square_para_tela(capturada, orientacao))
+
+    return casas
+
+
+def detectar_lance_visual_rapido(
+    board,
+    imagem_antiga,
+    imagem_nova,
+    orientacao,
+):
+    """
+    Escolhe o lance legal que melhor explica as casas que mudaram.
+    Não chama YOLO e não escreve 64 PNGs no disco.
+    """
+    diffs = _diferencas_por_casa(
+        imagem_antiga,
+        imagem_nova,
+    )
+
+    if not diffs:
+        return None, 0.0
+
+    valores = np.array(list(diffs.values()), dtype=np.float32)
+    mediana = float(np.median(valores))
+    desvio = float(np.std(valores))
+
+    # Threshold dinâmico. Hover isolado normalmente muda uma casa;
+    # um lance real muda origem + destino.
+    limiar = max(5.0, mediana + max(3.5, desvio * 0.55))
+
+    ranking = sorted(
+        diffs.items(),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    top = {casa for casa, _ in ranking[:5]}
+
+    melhor = None
+    melhor_score = float("-inf")
+    segundo_score = None
+
+    for movimento in board.legal_moves:
+        esperadas = _casas_esperadas_lance(
+            board,
+            movimento,
+            orientacao,
+        )
+
+        valores_esperados = [diffs[c] for c in esperadas]
+        if len(valores_esperados) < 2:
+            continue
+
+        origem = _square_para_tela(
+            movimento.from_square,
+            orientacao,
+        )
+        destino = _square_para_tela(
+            movimento.to_square,
+            orientacao,
+        )
+
+        # Origem e destino precisam ter alteração real.
+        minimo_principal = min(
+            diffs[origem],
+            diffs[destino],
+        )
+
+        if minimo_principal < limiar * 0.72:
+            continue
+
+        esperado_medio = float(np.mean(valores_esperados))
+        cobertura_top = len(esperadas & top)
+
+        inesperadas = [
+            valor
+            for casa, valor in ranking[:6]
+            if casa not in esperadas
+        ]
+        ruido = (
+            float(np.mean(inesperadas[:2]))
+            if inesperadas
+            else 0.0
+        )
+
+        score = (
+            esperado_medio
+            + minimo_principal * 0.75
+            + cobertura_top * 6.0
+            - ruido * 0.28
+        )
+
+        if score > melhor_score:
+            if melhor is not None:
+                segundo_score = melhor_score
+            melhor_score = score
+            melhor = movimento
+        elif segundo_score is None or score > segundo_score:
+            segundo_score = score
+
+    if melhor is None:
+        return None, 0.0
+
+    separacao = (
+        max(0.0, melhor_score - segundo_score)
+        if segundo_score is not None
+        else 0.0
+    )
+
+    # Score apenas informativo; sem números artificiais gigantes.
+    confianca = melhor_score + min(separacao, 80.0) * 0.35
+
+    # Evita aceitar hover/ruído como lance.
+    if confianca < 18.0:
+        return None, confianca
+
+    return melhor, confianca
+
+
+def mostrar_estado_rapido(board, minha_cor, movimento):
+    print("\n\n========================================")
+    print("⚡ LANCE ULTRA CONFIRMADO")
+    print("========================================")
+    print("\nLance detectado:")
+    print(f"- {movimento.uci()}")
+    print(f"\nFEN:\n{board.fen()}")
+    print(f"\nVez: {nome_cor(board.turn)}")
+
+    if board.turn == minha_cor:
+        print("\n✓ SUA VEZ")
+    else:
+        print("\nAguardando jogada do adversário...")
 
 # ============================================================
 # VISÃO
@@ -1826,6 +2054,65 @@ def sincronizar_candidatos(candidatos, fen_alvo):
     return None, proximos
 
 
+
+def confirmar_fim_visual(sct, board, orientacao):
+    """
+    Um mate/empate lógico só encerra o ARK se a posição física da tela
+    confirmar a mesma colocação de peças em duas leituras.
+    Isso impede que um fast-track falso encerre a partida.
+    """
+    alvo = board.board_fen()
+    acertos = 0
+
+    for _ in range(2):
+        leitura = ler_tabuleiro_uma_vez(
+            sct,
+            orientacao,
+        )
+
+        if (
+            leitura is not None
+            and leitura.fen_pecas == alvo
+        ):
+            acertos += 1
+
+        time.sleep(0.025)
+
+    return acertos >= 2
+
+
+def verificar_fim_partida_confirmado(
+    sct,
+    board,
+    minha_cor,
+    orientacao,
+):
+    if not board.is_game_over(claim_draw=False):
+        return False
+
+    print(
+        "\n⟳ Possível fim de partida detectado; "
+        "confirmando visualmente..."
+    )
+
+    if not confirmar_fim_visual(
+        sct,
+        board,
+        orientacao,
+    ):
+        print(
+            "⚠ Fim lógico rejeitado: a tela não confirmou "
+            "essa posição."
+        )
+        return False
+
+    return verificar_fim_partida(
+        board,
+        minha_cor,
+    )
+
+
+
 def verificar_fim_partida(board, minha_cor):
     if not board.is_game_over(claim_draw=False):
         return False
@@ -2104,11 +2391,11 @@ def ler_argumentos():
     parser = argparse.ArgumentParser(add_help=True)
     parser.add_argument(
         "--turno-inicial",
-        choices=("auto", "minha", "bot"),
-        default="auto",
+        choices=("minha", "bot"),
+        default="minha",
         help=(
-            "Em partida já iniciada: auto espera um lance; "
-            "minha/bot define quem joga agora."
+            "Em partida já iniciada, informe explicitamente "
+            "se é sua vez ou a vez do bot."
         ),
     )
     return parser.parse_args()
@@ -2232,7 +2519,7 @@ def main():
     print(f"          ARK CHESS {VERSAO}")
     print("       SISTEMA DE TREINAMENTO")
     print("========================================")
-    print("Base: V12 estável")
+    print("Base: V28 Ultra + proteção anti-fantasma")
     print("Acompanhamento da janela: ON")
     print("Localização automática do board: ON")
     print("Frame da visão normalizado: 816x816")
@@ -2240,6 +2527,8 @@ def main():
     print("Proteção contra espera/ruído: ON")
     print("Diagnóstico automático de visão: ON")
     print("Recuperação explícita de roque: ON")
+    print("Fast-Track sem YOLO durante os lances: ON")
+    print("Confirmação visual de fim de partida: ON")
     print(f"Turno inicial: {args.turno_inicial}")
 
     if not validar_ambiente():
@@ -2352,23 +2641,6 @@ def main():
                             "\n⚠ O turno foi informado, mas o estado "
                             "precisa de uma confirmação visual."
                         )
-                else:
-                    candidatos = gerar_candidatos_reabertura(
-                        leitura_inicial.fen_pecas
-                    )
-
-                    estado_provisorio = True
-                    fen_base_provisoria = (
-                        leitura_inicial.fen_pecas
-                    )
-
-                    print(
-                        "\n⟳ Partida já estava em andamento."
-                    )
-                    print(
-                        "Modo AUTO: aguardando UMA mudança real no "
-                        "tabuleiro para sincronizar o turno."
-                    )
 
             if board_confirmado is not None:
                 mostrar_estado(
@@ -2377,10 +2649,12 @@ def main():
                     minha_cor,
                 )
 
-                if verificar_fim_partida(
+                if verificar_fim_partida_confirmado(
+                    sct,
                     board_confirmado,
                     minha_cor,
-                ):
+                    orientacao,
+                    ):
                     return 0
 
                 if board_confirmado.turn == minha_cor:
@@ -2435,6 +2709,69 @@ def main():
                 )
 
                 fen_referencia_logica = None
+
+                # V28 ULTRA: tenta primeiro descobrir o lance somente
+                # pelas casas alteradas + lista de lances legais.
+                # YOLO vira fallback, não o caminho normal.
+                if (
+                    board_confirmado is not None
+                    and mudanca_visual_forte
+                ):
+                    movimento_ultra, confianca_ultra = (
+                        detectar_lance_visual_rapido(
+                            board_confirmado,
+                            imagem_referencia,
+                            frame,
+                            orientacao,
+                        )
+                    )
+
+                    if movimento_ultra is not None:
+                        board_confirmado.push(
+                            movimento_ultra
+                        )
+
+                        # Captura curta pós-animação; sem YOLO.
+                        time.sleep(0.018)
+                        frame_pos = capturar_frame(sct)
+                        imagem_referencia = (
+                            frame_pos.copy()
+                            if frame_pos is not None
+                            else frame.copy()
+                        )
+
+                        ultima_releitura = time.time()
+                        falhas_mesma_posicao = 0
+                        ultimo_fen_falhou = None
+                        inicio_falha_persistente = None
+                        limpar_status(memoria_status)
+
+                        print(
+                            f"\n⚡ Fast-track visual "
+                            f"({confianca_ultra:.1f})"
+                        )
+
+                        mostrar_estado_rapido(
+                            board_confirmado,
+                            minha_cor,
+                            movimento_ultra,
+                        )
+
+                        if verificar_fim_partida_confirmado(
+                            sct,
+                            board_confirmado,
+                            minha_cor,
+                            orientacao,
+                            ):
+                            break
+
+                        if board_confirmado.turn == minha_cor:
+                            analisar_stockfish(
+                                stockfish,
+                                board_confirmado,
+                            )
+
+                        continue
 
                 if board_confirmado is not None:
                     fen_referencia_logica = (
@@ -2539,10 +2876,12 @@ def main():
                             recuperado=recuperado,
                         )
 
-                        if verificar_fim_partida(
+                        if verificar_fim_partida_confirmado(
+                            sct,
                             board_confirmado,
                             minha_cor,
-                        ):
+                            orientacao,
+                            ):
                             break
 
                         if board_confirmado.turn == minha_cor:
@@ -2689,28 +3028,53 @@ def main():
 
                         continue
 
-                    candidatos = gerar_candidatos_reabertura(
-                        fen_novo
+                    # V28: em vez de congelar aguardando outro lance,
+                    # usa a posição visual atual como fallback imediato.
+                    # Mantém o lado esperado pela alternância do último estado.
+                    lado_fallback = (
+                        not board_confirmado.turn
+                        if board_confirmado is not None
+                        else minha_cor
                     )
 
+                    board_fallback = criar_board_turno_manual(
+                        fen_novo,
+                        lado_fallback,
+                    )
+
+                    if board_fallback is not None:
+                        board_confirmado = board_fallback
+                        estado_provisorio = False
+                        candidatos = []
+                        fen_base_provisoria = None
+                        imagem_referencia = leitura.imagem.copy()
+
+                        falhas_mesma_posicao = 0
+                        ultimo_fen_falhou = None
+                        inicio_falha_persistente = None
+
+                        print(
+                            "\n\n⚡ Ressincronização visual imediata."
+                        )
+                        mostrar_estado(
+                            leitura,
+                            board_confirmado,
+                            minha_cor,
+                        )
+
+                        if board_confirmado.turn == minha_cor:
+                            analisar_stockfish(
+                                stockfish,
+                                board_confirmado,
+                            )
+
+                        continue
+
+                    # Só entra no modo provisório se até o fallback visual falhar.
+                    candidatos = gerar_candidatos_reabertura(fen_novo)
                     board_confirmado = None
                     estado_provisorio = True
                     fen_base_provisoria = fen_novo
-
-                    falhas_mesma_posicao = 0
-                    ultimo_fen_falhou = None
-
-                    print(
-                        "\n\n⟳ Sincronização perdida com segurança."
-                    )
-                    print(
-                        "O estado anterior NÃO foi sobrescrito no chute."
-                    )
-                    print(
-                        "Aguardando o próximo lance real para confirmar "
-                        "o novo estado."
-                    )
-
                     continue
 
                 # ====================================================
@@ -2779,10 +3143,12 @@ def main():
                             movimentos=resultado.movimentos,
                         )
 
-                        if verificar_fim_partida(
+                        if verificar_fim_partida_confirmado(
+                            sct,
                             board_confirmado,
                             minha_cor,
-                        ):
+                            orientacao,
+                            ):
                             break
 
                         if (
