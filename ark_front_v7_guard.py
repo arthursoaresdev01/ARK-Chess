@@ -12,7 +12,6 @@ from PySide6.QtWidgets import (
     QMainWindow, QPushButton, QTextEdit, QVBoxLayout, QWidget
 )
 
-# pyrefly: ignore [missing-import]
 from ark_overlay_v3 import ArkOverlay
 
 BACKEND = Path(__file__).with_name("testar_captura_v29_guard.py")
@@ -157,7 +156,7 @@ class ArkChessWindow(QMainWindow):
 
         self.combo_turno = QComboBox()
         self.combo_turno.addItem("Minha vez agora", "minha")
-        self.combo_turno.addItem("Vez do bot agora", "bot")
+        self.combo_turno.addItem("Vez do adversário agora", "adversario")
         el.addWidget(self.combo_turno)
 
         self.btn_start = QPushButton("▶  INICIAR ARK")
@@ -362,7 +361,7 @@ class ArkChessWindow(QMainWindow):
             self.lbl_estado.setText("Estado: sua vez")
 
         elif "Aguardando jogada do adversário" in linha:
-            self.lbl_estado.setText("Estado: aguardando bot")
+            self.lbl_estado.setText("Estado: aguardando adversário")
             self.overlay.clear_move()
 
         elif "ARK CHESS ATIVO" in linha:

@@ -2391,11 +2391,11 @@ def ler_argumentos():
     parser = argparse.ArgumentParser(add_help=True)
     parser.add_argument(
         "--turno-inicial",
-        choices=("minha", "bot"),
+        choices=("minha", "adversario"),
         default="minha",
         help=(
             "Em partida já iniciada, informe explicitamente "
-            "se é sua vez ou a vez do bot."
+            "se é sua vez ou a vez do adversário."
         ),
     )
     return parser.parse_args()
@@ -2405,7 +2405,7 @@ def lado_inicial_escolhido(opcao, minha_cor):
     if opcao == "minha":
         return minha_cor
 
-    if opcao == "bot":
+    if opcao == "adversario":
         return not minha_cor
 
     return None
@@ -2551,7 +2551,7 @@ def main():
 
     try:
         with mss.MSS() as sct:
-            print("\nAbra o tabuleiro contra o bot.")
+            print("\nAbra o tabuleiro contra o adversário.")
 
             if iniciar_acompanhamento_janela(sct):
                 print("✓ Janela do Chess.com encontrada.")
