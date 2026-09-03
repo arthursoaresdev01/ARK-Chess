@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 from ark_overlay_v3 import ArkOverlay
 
 BACKEND = Path(__file__).with_name("testar_captura_v29_guard.py")
+RESET_FLAG = Path(__file__).with_name("ark_reset.flag")
 
 
 class ArkCard(QFrame):
@@ -150,18 +151,24 @@ class ArkChessWindow(QMainWindow):
         self.status_engine.setObjectName("muted")
         el.addWidget(self.status_engine)
 
-        turno_txt = QLabel("Ao abrir uma partida já em andamento:")
+        turno_txt = QLabel("Ao iniciar ou resetar uma partida em andamento:")
         turno_txt.setObjectName("muted")
         el.addWidget(turno_txt)
 
         self.combo_turno = QComboBox()
         self.combo_turno.addItem("Minha vez agora", "minha")
-        self.combo_turno.addItem("Vez do adversário agora", "adversario")
+        self.combo_turno.addItem("Vez do adversário agora", "bot")
         el.addWidget(self.combo_turno)
 
         self.btn_start = QPushButton("▶  INICIAR ARK")
         self.btn_start.clicked.connect(self.alternar_ark)
         el.addWidget(self.btn_start)
+
+        self.btn_reset = QPushButton("↻  RESET SEGURO")
+        self.btn_reset.setObjectName("secondary")
+        self.btn_reset.setEnabled(False)
+        self.btn_reset.clicked.connect(self.resetar_ark)
+        el.addWidget(self.btn_reset)
 
         body.addWidget(engine)
 
@@ -279,12 +286,49 @@ class ArkChessWindow(QMainWindow):
 
         self.processo.start(sys.executable, argumentos)
 
-        self.combo_turno.setEnabled(False)
+        self.combo_turno.setEnabled(True)
+        self.btn_reset.setEnabled(True)
         self.btn_start.setText("■  PARAR ARK")
         self.status_engine.setText("Iniciando backend V29 Guard...")
         self.mudar_status(True)
         self.log.append(
             f"Iniciando ARK V29 Guard • turno inicial: {opcao_turno}"
+        )
+
+    def resetar_ark(self):
+        if (
+            not self.processo
+            or self.processo.state() == QProcess.NotRunning
+        ):
+            self.log.append("ARK precisa estar ativo para usar RESET SEGURO.")
+            return
+
+        self.overlay.clear_move()
+        self.lbl_jogada.setText("—")
+        self.lbl_estado.setText("Estado: resetando...")
+        self.status_engine.setText("Confirmando tabuleiro...")
+
+        opcao_turno = self.combo_turno.currentData()
+
+        try:
+            RESET_FLAG.write_text(
+                str(opcao_turno),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            self.log.append(
+                f"ERRO ao solicitar reset: {exc}"
+            )
+            return
+
+        texto_turno = (
+            "sua vez"
+            if opcao_turno == "minha"
+            else "vez do adversário"
+        )
+
+        self.log.append(
+            f"↻ RESET SEGURO solicitado • {texto_turno}"
         )
 
     def parar_ark(self):
@@ -303,6 +347,7 @@ class ArkChessWindow(QMainWindow):
         self.overlay.clear_move()
 
         self.btn_start.setText("▶  INICIAR ARK")
+        self.btn_reset.setEnabled(False)
         self.combo_turno.setEnabled(True)
         self.status_engine.setText(f"ARK parado • código {exit_code}")
         self.lbl_estado.setText("Estado: parado")
@@ -361,8 +406,12 @@ class ArkChessWindow(QMainWindow):
             self.lbl_estado.setText("Estado: sua vez")
 
         elif "Aguardando jogada do adversário" in linha:
-            self.lbl_estado.setText("Estado: aguardando adversário")
+            self.lbl_estado.setText("Estado: aguardando bot")
             self.overlay.clear_move()
+
+        elif "RESET SEGURO concluído" in linha:
+            self.status_engine.setText("Sistema ativo")
+            self.lbl_estado.setText("Estado: sincronizado")
 
         elif "ARK CHESS ATIVO" in linha:
             self.status_engine.setText("Sistema ativo")

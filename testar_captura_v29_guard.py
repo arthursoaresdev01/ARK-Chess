@@ -36,6 +36,7 @@ from analisar_tabuleiro import (
     analisar_tabuleiro,
     mostrar_tabuleiro,
     SIMBOLOS,
+    analisar_casas_imagem,
 )
 
 
@@ -43,7 +44,7 @@ from analisar_tabuleiro import (
 # CONFIGURAÇÕES
 # ============================================================
 
-VERSAO = "V29-GUARD"
+VERSAO = "V33-FAST-SAFE"
 
 # Região EXATA da V12 que já funcionou com o classificador.
 MONITOR_FIXO_V12 = {
@@ -69,6 +70,7 @@ TAMANHO_FRAME_ARK = 816
 PASTA_CASAS = Path("casas")
 ARQUIVO_TABULEIRO_ATUAL = Path("tabuleiro_atual.png")
 ARQUIVO_LOG = Path("ark_chess.log")
+ARQUIVO_RESET = Path("ark_reset.flag")
 
 # V25: diagnóstico automático quando a posição inicial não valida.
 PASTA_DIAGNOSTICOS = Path("diagnosticos_v25")
@@ -106,7 +108,13 @@ INTERVALO_AGRESSIVO = 0.015
 CONFIANCA_MEDIA_MINIMA = 0.52
 
 # Recuperação de sincronização
-MAX_PLIES_RECUPERACAO = 3
+MAX_PLIES_RECUPERACAO = 1
+
+# V33 FAST SAFE: velocidade com confirmação YOLO apenas nas casas do lance.
+FAST_TRACK_ATIVO = True
+FAST_TRACK_SEPARACAO_MINIMA = 10.0
+FAST_TRACK_CONFIANCA_YOLO_MIN = 0.68
+FAST_TRACK_MARGEM_YOLO_MIN = 0.08
 MAX_ESTADOS_BFS = 25000
 # V22: não abandona o board confirmado por ruído temporário.
 FALHAS_ATE_RESSINCRONIZAR = 4
@@ -1107,11 +1115,100 @@ def detectar_lance_visual_rapido(
     # Score apenas informativo; sem números artificiais gigantes.
     confianca = melhor_score + min(separacao, 80.0) * 0.35
 
+    # V33: o melhor candidato também precisa vencer claramente o segundo.
+    # Isso evita escolher um lance legal errado quando dois lances explicam
+    # quase igualmente a mesma mudança visual.
+    if segundo_score is not None and separacao < FAST_TRACK_SEPARACAO_MINIMA:
+        return None, confianca
+
     # Evita aceitar hover/ruído como lance.
     if confianca < 18.0:
         return None, confianca
 
     return melhor, confianca
+
+
+def _tela_para_square(linha, coluna, orientacao):
+    if orientacao == "p":
+        rank = linha
+        arquivo = 7 - coluna
+    else:
+        rank = 7 - linha
+        arquivo = coluna
+
+    return chess.square(arquivo, rank)
+
+
+def _classe_yolo_esperada(peca):
+    if peca is None:
+        return "vazia"
+
+    nomes = {
+        chess.PAWN: "peao",
+        chess.KNIGHT: "cavalo",
+        chess.BISHOP: "bispo",
+        chess.ROOK: "torre",
+        chess.QUEEN: "rainha",
+        chess.KING: "rei",
+    }
+    cor = "branco" if peca.color == chess.WHITE else "preto"
+    return f"{nomes[peca.piece_type]}_{cor}"
+
+
+def confirmar_lance_fast_track_yolo(
+    board,
+    movimento,
+    frame,
+    orientacao,
+):
+    """
+    Confirma somente as casas que deveriam mudar após o lance.
+    Não altera o board. Retorna True apenas se todas baterem com
+    o estado esperado depois do movimento.
+    """
+    if movimento not in board.legal_moves or frame is None:
+        return False
+
+    casas = _casas_esperadas_lance(board, movimento, orientacao)
+    if len(casas) < 2:
+        return False
+
+    depois = board.copy(stack=False)
+    depois.push(movimento)
+
+    try:
+        leituras = analisar_casas_imagem(frame, casas)
+    except Exception as exc:
+        logger.debug("Fast-Track YOLO falhou: %s", exc)
+        return False
+
+    if len(leituras) != len(casas):
+        return False
+
+    for linha, coluna in casas:
+        leitura = leituras.get((linha, coluna))
+        if leitura is None:
+            return False
+
+        classe, conf1, conf2 = leitura
+        square = _tela_para_square(linha, coluna, orientacao)
+        esperada = _classe_yolo_esperada(depois.piece_at(square))
+        margem = float(conf1) - float(conf2)
+
+        if classe != esperada:
+            logger.debug(
+                "Fast-Track rejeitado em %s: esperado=%s obtido=%s",
+                chess.square_name(square), esperada, classe,
+            )
+            return False
+
+        if float(conf1) < FAST_TRACK_CONFIANCA_YOLO_MIN:
+            return False
+
+        if margem < FAST_TRACK_MARGEM_YOLO_MIN:
+            return False
+
+    return True
 
 
 def mostrar_estado_rapido(board, minha_cor, movimento):
@@ -1690,17 +1787,29 @@ def reconhecer_inicio(sct):
 
         orientacao, score = detectar_cor_em_baixo(tabuleiro)
 
-        leitura = reconhecer_consenso(
+        # V30: a primeira leitura válida já conta como a 1ª confirmação.
+        # Antes o início fazia 1 leitura aqui + 2 leituras no consenso,
+        # totalizando 3 passagens completas pelo classificador. Agora
+        # fazemos apenas mais 1 leitura e exigimos que o FEN bata.
+        confianca_inicial = confianca_media_tabuleiro(tabuleiro)
+        fen_inicial_lido = gerar_fen_pecas(tabuleiro, orientacao)
+
+        leitura_confirmacao = ler_tabuleiro_uma_vez(
             sct,
             orientacao,
         )
 
-        if leitura is None:
+        if (
+            leitura_confirmacao is None
+            or leitura_confirmacao.fen_pecas != fen_inicial_lido
+        ):
             imprimir_status_controlado(
                 "⟳ Confirmando tabuleiro...",
                 memoria,
             )
             continue
+
+        leitura = leitura_confirmacao
 
         # Recalcula orientação em cima da leitura confirmada.
         orientacao_confirmada, score_confirmado = detectar_cor_em_baixo(
@@ -2325,6 +2434,36 @@ def analisar_stockfish(stockfish, board):
 
     movimento = pv[0]
 
+    # V32 LOCK: nunca exibe sugestão incompatível com o board atual.
+    if movimento not in board.legal_moves:
+        logger.error(
+            "Sugestão ilegal bloqueada: %s | FEN=%s",
+            movimento.uci(),
+            board.fen(),
+        )
+        print(
+            "\n⚠ Sugestão bloqueada: lance incompatível com "
+            "o tabuleiro confirmado."
+        )
+        print("⟳ Revalidando antes de sugerir outra jogada...")
+        return
+
+    peca_origem = board.piece_at(movimento.from_square)
+    if (
+        peca_origem is None
+        or peca_origem.color != board.turn
+    ):
+        logger.error(
+            "Sugestão com origem inválida bloqueada: %s | FEN=%s",
+            movimento.uci(),
+            board.fen(),
+        )
+        print(
+            "\n⚠ Sugestão bloqueada: origem incompatível com "
+            "o tabuleiro confirmado."
+        )
+        return
+
     print("\nMELHOR JOGADA:\n")
     print(
         formatar_melhor_jogada(
@@ -2391,11 +2530,11 @@ def ler_argumentos():
     parser = argparse.ArgumentParser(add_help=True)
     parser.add_argument(
         "--turno-inicial",
-        choices=("minha", "adversario"),
+        choices=("minha", "bot"),
         default="minha",
         help=(
             "Em partida já iniciada, informe explicitamente "
-            "se é sua vez ou a vez do adversário."
+            "se é sua vez ou a vez do bot."
         ),
     )
     return parser.parse_args()
@@ -2405,7 +2544,7 @@ def lado_inicial_escolhido(opcao, minha_cor):
     if opcao == "minha":
         return minha_cor
 
-    if opcao == "adversario":
+    if opcao == "bot":
         return not minha_cor
 
     return None
@@ -2508,6 +2647,65 @@ def procurar_transicao_v26(
     )
 
 
+
+def ler_pedido_reset():
+    if not ARQUIVO_RESET.exists():
+        return None
+
+    try:
+        valor = ARQUIVO_RESET.read_text(
+            encoding="utf-8"
+        ).strip().lower()
+    except Exception:
+        valor = "minha"
+
+    try:
+        ARQUIVO_RESET.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    if valor not in ("minha", "bot", "adversario"):
+        valor = "minha"
+
+    return valor
+
+
+def reconhecer_reset_confiavel(sct, orientacao):
+    """
+    Reset V32:
+    exige o mesmo FEN em 3 leituras válidas antes de aceitar.
+    """
+    contagem = {}
+    melhor_por_fen = {}
+
+    for _ in range(6):
+        leitura = ler_tabuleiro_uma_vez(
+            sct,
+            orientacao,
+        )
+
+        if leitura is None:
+            time.sleep(0.05)
+            continue
+
+        fen = leitura.fen_pecas
+        contagem[fen] = contagem.get(fen, 0) + 1
+
+        anterior = melhor_por_fen.get(fen)
+        if (
+            anterior is None
+            or leitura.confianca_media > anterior.confianca_media
+        ):
+            melhor_por_fen[fen] = leitura
+
+        if contagem[fen] >= 3:
+            return melhor_por_fen[fen]
+
+        time.sleep(0.05)
+
+    return None
+
+
 # ============================================================
 # LOOP PRINCIPAL
 # ============================================================
@@ -2519,7 +2717,7 @@ def main():
     print(f"          ARK CHESS {VERSAO}")
     print("       SISTEMA DE TREINAMENTO")
     print("========================================")
-    print("Base: V28 Ultra + proteção anti-fantasma")
+    print("Base: V32 Lock + Fast-Track 2.0 com confirmação YOLO localizada")
     print("Acompanhamento da janela: ON")
     print("Localização automática do board: ON")
     print("Frame da visão normalizado: 816x816")
@@ -2527,7 +2725,7 @@ def main():
     print("Proteção contra espera/ruído: ON")
     print("Diagnóstico automático de visão: ON")
     print("Recuperação explícita de roque: ON")
-    print("Fast-Track sem YOLO durante os lances: ON")
+    print("Fast-Track 2.0: ON (mudança visual + YOLO só nas casas do lance)")
     print("Confirmação visual de fim de partida: ON")
     print(f"Turno inicial: {args.turno_inicial}")
 
@@ -2677,6 +2875,87 @@ def main():
             while True:
                 time.sleep(INTERVALO_LOOP)
 
+                pedido_reset = ler_pedido_reset()
+
+                if pedido_reset is not None:
+                    print("\n\n↻ RESET SEGURO solicitado...")
+                    print("⟳ Confirmando o tabuleiro em 3 leituras iguais...")
+
+                    leitura_reset = reconhecer_reset_confiavel(
+                        sct,
+                        orientacao,
+                    )
+
+                    if leitura_reset is None:
+                        print(
+                            "⚠ RESET NÃO CONFIRMADO: as leituras não "
+                            "ficaram estáveis. Estado anterior mantido."
+                        )
+                        continue
+
+                    fen_reset = leitura_reset.fen_pecas
+                    board_reset = None
+                    movimentos_reset = []
+
+                    if board_confirmado is not None:
+                        if fen_reset == board_confirmado.board_fen():
+                            board_reset = board_confirmado.copy(stack=True)
+                        else:
+                            transicao_reset = procurar_transicao_v26(
+                                board_confirmado,
+                                fen_reset,
+                                max_plies=1,
+                            )
+                            if transicao_reset is not None:
+                                board_reset = transicao_reset.board
+                                movimentos_reset = transicao_reset.movimentos
+
+                    if board_reset is None:
+                        lado_reset = lado_inicial_escolhido(
+                            pedido_reset,
+                            minha_cor,
+                        )
+                        board_reset = criar_board_turno_manual(
+                            fen_reset,
+                            lado_reset,
+                        )
+
+                    if board_reset is None or not board_reset.is_valid():
+                        print(
+                            "⚠ RESET NÃO CONFIRMADO: posição visual inválida."
+                        )
+                        continue
+
+                    board_confirmado = board_reset
+                    candidatos = []
+                    estado_provisorio = False
+                    fen_base_provisoria = None
+                    imagem_referencia = leitura_reset.imagem.copy()
+
+                    ultima_releitura = time.time()
+                    falhas_mesma_posicao = 0
+                    ultimo_fen_falhou = None
+                    inicio_falha_persistente = None
+                    memoria_status = {}
+
+                    print("✓ RESET SEGURO concluído.")
+
+                    mostrar_estado(
+                        leitura_reset,
+                        board_confirmado,
+                        minha_cor,
+                        movimentos=movimentos_reset or None,
+                        recuperado=True,
+                    )
+
+                    if board_confirmado.turn == minha_cor:
+                        analisar_stockfish(
+                            stockfish,
+                            board_confirmado,
+                        )
+
+                    continue
+
                 frame = capturar_frame(sct)
 
                 if frame is None:
@@ -2714,7 +2993,8 @@ def main():
                 # pelas casas alteradas + lista de lances legais.
                 # YOLO vira fallback, não o caminho normal.
                 if (
-                    board_confirmado is not None
+                    FAST_TRACK_ATIVO
+                    and board_confirmado is not None
                     and mudanca_visual_forte
                 ):
                     movimento_ultra, confianca_ultra = (
@@ -2727,51 +3007,65 @@ def main():
                     )
 
                     if movimento_ultra is not None:
-                        board_confirmado.push(
-                            movimento_ultra
-                        )
-
-                        # Captura curta pós-animação; sem YOLO.
-                        time.sleep(0.018)
+                        # V33 FAST SAFE: espera só o fim curtíssimo da animação
+                        # e confirma APENAS as casas envolvidas no lance.
+                        time.sleep(0.025)
                         frame_pos = capturar_frame(sct)
-                        imagem_referencia = (
-                            frame_pos.copy()
-                            if frame_pos is not None
-                            else frame.copy()
-                        )
 
-                        ultima_releitura = time.time()
-                        falhas_mesma_posicao = 0
-                        ultimo_fen_falhou = None
-                        inicio_falha_persistente = None
-                        limpar_status(memoria_status)
-
-                        print(
-                            f"\n⚡ Fast-track visual "
-                            f"({confianca_ultra:.1f})"
-                        )
-
-                        mostrar_estado_rapido(
+                        fast_confirmado = confirmar_lance_fast_track_yolo(
                             board_confirmado,
-                            minha_cor,
                             movimento_ultra,
+                            frame_pos if frame_pos is not None else frame,
+                            orientacao,
                         )
 
-                        if verificar_fim_partida_confirmado(
-                            sct,
-                            board_confirmado,
-                            minha_cor,
-                            orientacao,
-                            ):
-                            break
+                        if fast_confirmado:
+                            board_confirmado.push(movimento_ultra)
 
-                        if board_confirmado.turn == minha_cor:
-                            analisar_stockfish(
-                                stockfish,
-                                board_confirmado,
+                            imagem_referencia = (
+                                frame_pos.copy()
+                                if frame_pos is not None
+                                else frame.copy()
                             )
 
-                        continue
+                            ultima_releitura = time.time()
+                            falhas_mesma_posicao = 0
+                            ultimo_fen_falhou = None
+                            inicio_falha_persistente = None
+                            limpar_status(memoria_status)
+
+                            print(
+                                f"\n⚡ Fast-Track 2.0 confirmado "
+                                f"({confianca_ultra:.1f})"
+                            )
+
+                            mostrar_estado_rapido(
+                                board_confirmado,
+                                minha_cor,
+                                movimento_ultra,
+                            )
+
+                            if verificar_fim_partida_confirmado(
+                                sct,
+                                board_confirmado,
+                                minha_cor,
+                                orientacao,
+                                ):
+                                break
+
+                            if board_confirmado.turn == minha_cor:
+                                analisar_stockfish(
+                                    stockfish,
+                                    board_confirmado,
+                                )
+
+                            continue
+
+                        # Falhou a confirmação curta: NÃO empurra o lance.
+                        # O fluxo normal abaixo fará a leitura completa.
+                        logger.debug(
+                            "Fast-Track 2.0 rejeitado; usando YOLO completo."
+                        )
 
                 if board_confirmado is not None:
                     fen_referencia_logica = (
@@ -3028,22 +3322,23 @@ def main():
 
                         continue
 
-                    # V28: em vez de congelar aguardando outro lance,
-                    # usa a posição visual atual como fallback imediato.
-                    # Mantém o lado esperado pela alternância do último estado.
-                    lado_fallback = (
-                        not board_confirmado.turn
-                        if board_confirmado is not None
-                        else minha_cor
-                    )
+                    # V30 SAFE-RESYNC:
+                    # NUNCA transforma uma leitura visual isolada na verdade
+                    # oficial durante uma partida ativa. Esse fallback da V28
+                    # podia aceitar um FEN impossível e fazer o Stockfish
+                    # sugerir um lance correto para um tabuleiro errado.
+                    #
+                    # Primeiro tenta uma recuperação legal um pouco mais longa.
+                    recuperacao_segura = None
+                    if board_confirmado is not None:
+                        recuperacao_segura = procurar_transicao_v26(
+                            board_confirmado,
+                            fen_novo,
+                            max_plies=MAX_PLIES_RECUPERACAO,
+                        )
 
-                    board_fallback = criar_board_turno_manual(
-                        fen_novo,
-                        lado_fallback,
-                    )
-
-                    if board_fallback is not None:
-                        board_confirmado = board_fallback
+                    if recuperacao_segura is not None:
+                        board_confirmado = recuperacao_segura.board
                         estado_provisorio = False
                         candidatos = []
                         fen_base_provisoria = None
@@ -3054,12 +3349,14 @@ def main():
                         inicio_falha_persistente = None
 
                         print(
-                            "\n\n⚡ Ressincronização visual imediata."
+                            "\n\n✓ Ressincronização legal recuperada."
                         )
                         mostrar_estado(
                             leitura,
                             board_confirmado,
                             minha_cor,
+                            movimentos=recuperacao_segura.movimentos,
+                            recuperado=True,
                         )
 
                         if board_confirmado.turn == minha_cor:
@@ -3070,11 +3367,18 @@ def main():
 
                         continue
 
-                    # Só entra no modo provisório se até o fallback visual falhar.
-                    candidatos = gerar_candidatos_reabertura(fen_novo)
-                    board_confirmado = None
-                    estado_provisorio = True
-                    fen_base_provisoria = fen_novo
+                    # Se a nova visão não pode ser explicada por lances legais,
+                    # ela é tratada como ruído. O último board confirmado continua
+                    # sendo a fonte da verdade; no próximo ciclo o ARK tenta de novo
+                    # a partir dele. Assim um frame ruim nunca vira estado oficial.
+                    print(
+                        "\n\n⚠ Leitura inconsistente descartada; "
+                        "mantendo último estado confirmado."
+                    )
+                    falhas_mesma_posicao = 0
+                    ultimo_fen_falhou = None
+                    inicio_falha_persistente = None
+                    time.sleep(0.08)
                     continue
 
                 # ====================================================
