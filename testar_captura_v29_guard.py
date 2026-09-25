@@ -2664,7 +2664,7 @@ def ler_pedido_reset():
     except Exception:
         pass
 
-    if valor not in ("minha", "bot", "adversario"):
+    if valor not in ("minha", "bot", "adversario", "auto"):
         valor = "minha"
 
     return valor
@@ -2727,6 +2727,7 @@ def main():
     print("Recuperação explícita de roque: ON")
     print("Fast-Track 2.0: ON (mudança visual + YOLO só nas casas do lance)")
     print("Confirmação visual de fim de partida: ON")
+    print("Auto-reset sem inventar turno: ON")
     print(f"Turno inicial: {args.turno_inicial}")
 
     if not validar_ambiente():
@@ -2901,14 +2902,28 @@ def main():
                         if fen_reset == board_confirmado.board_fen():
                             board_reset = board_confirmado.copy(stack=True)
                         else:
+                            # Reset seguro: tenta recuperar até alguns plies.
+                            # Isso cobre o caso em que o ARK perdeu nossa jogada
+                            # e também a resposta do adversário.
                             transicao_reset = procurar_transicao_v26(
                                 board_confirmado,
                                 fen_reset,
-                                max_plies=1,
+                                max_plies=MAX_PLIES_RECUPERACAO,
                             )
                             if transicao_reset is not None:
                                 board_reset = transicao_reset.board
                                 movimentos_reset = transicao_reset.movimentos
+
+                    if board_reset is None and pedido_reset == "auto":
+                        # REGRA V34: reset automático NUNCA inventa o turno.
+                        # Se a posição atual não puder ser provada por uma
+                        # sequência legal a partir do último board confirmado,
+                        # mantém o estado anterior e espera nova evidência.
+                        print(
+                            "⚠ AUTO-RESET NÃO CONFIRMADO: não foi possível "
+                            "provar uma transição legal. Estado anterior mantido."
+                        )
+                        continue
 
                     if board_reset is None:
                         lado_reset = lado_inicial_escolhido(

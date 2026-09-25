@@ -1,14 +1,15 @@
 import re
 import sys
+import ctypes
 from pathlib import Path
 
 # pyrefly: ignore [missing-import]
-from PySide6.QtCore import QProcess, Qt
+from PySide6.QtCore import QProcess, Qt, QTimer
 # pyrefly: ignore [missing-import]
 from PySide6.QtGui import QFont, QGuiApplication
 # pyrefly: ignore [missing-import]
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFrame, QHBoxLayout, QLabel,
+    QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel,
     QMainWindow, QPushButton, QTextEdit, QVBoxLayout, QWidget
 )
 
@@ -31,6 +32,34 @@ class ArkChessWindow(QMainWindow):
         self.processo = None
         self.esperando_melhor_jogada = False
         self.expandido = False
+
+        # Auto Play é opcional e começa desligado.
+        # Destinado ao modo de treino/jogos contra bots.
+        self.board_left = None
+        self.board_top = None
+        self.board_size = None
+        self.white_at_bottom = True
+        self.autoplay_em_execucao = False
+        self.autoplay_aguardando_confirmacao = False
+        self.autoplay_jogada_pendente = None
+        self.autoplay_watchdog_ms = 4500
+        self.autoplay_reset_tentado = False
+        self.autoplay_delay_ms = 900
+        self.backend_diz_minha_vez = False
+        self.partida_encerrada = False
+        self.ultimo_lance_autoplay = None
+        self.ultimo_lance_autoplay_em = 0
+
+        self.timer_autoplay = QTimer(self)
+        self.timer_autoplay.setSingleShot(True)
+
+        self.timer_watchdog = QTimer(self)
+        self.timer_watchdog.setSingleShot(True)
+        self.timer_watchdog.timeout.connect(self._autoplay_watchdog)
+
+        self.timer_pos_reset = QTimer(self)
+        self.timer_pos_reset.setSingleShot(True)
+        self.timer_pos_reset.timeout.connect(self._autoplay_pos_reset)
 
         # Overlay independente e click-through.
         self.overlay = ArkOverlay()
@@ -160,6 +189,15 @@ class ArkChessWindow(QMainWindow):
         self.combo_turno.addItem("Vez do adversário agora", "bot")
         el.addWidget(self.combo_turno)
 
+        # Auto Play começa sempre desligado. Nesta etapa ele apenas
+        # prepara o controle da interface; o overlay continua sendo o padrão.
+        self.chk_autoplay = QCheckBox("Auto Play")
+        self.chk_autoplay.setChecked(False)
+        self.chk_autoplay.setToolTip(
+            "Executa automaticamente as jogadas no modo de treino contra bots."
+        )
+        el.addWidget(self.chk_autoplay)
+
         self.btn_start = QPushButton("▶  INICIAR ARK")
         self.btn_start.clicked.connect(self.alternar_ark)
         el.addWidget(self.btn_start)
@@ -258,6 +296,8 @@ class ArkChessWindow(QMainWindow):
             self.iniciar_ark()
 
     def iniciar_ark(self):
+        self.partida_encerrada = False
+        self.backend_diz_minha_vez = False
         if not BACKEND.exists():
             self.log.append(f"ERRO: não encontrei {BACKEND.name}")
             self.status_engine.setText("Backend V26 não encontrado")
@@ -296,6 +336,15 @@ class ArkChessWindow(QMainWindow):
         )
 
     def resetar_ark(self):
+        self.backend_diz_minha_vez = False
+        self.partida_encerrada = False
+        havia_autoplay_pendente = (
+            self.autoplay_aguardando_confirmacao
+            or self.autoplay_em_execucao
+        )
+        if hasattr(self, "timer_autoplay"):
+            self.timer_autoplay.stop()
+        self._limpar_autoplay_pendente()
         if (
             not self.processo
             or self.processo.state() == QProcess.NotRunning
@@ -308,9 +357,14 @@ class ArkChessWindow(QMainWindow):
         self.lbl_estado.setText("Estado: resetando...")
         self.status_engine.setText("Confirmando tabuleiro...")
 
-        opcao_turno = self.combo_turno.currentData()
+        opcao_turno = (
+            "minha"
+            if havia_autoplay_pendente
+            else self.combo_turno.currentData()
+        )
 
         try:
+            RESET_FLAG.unlink(missing_ok=True)
             RESET_FLAG.write_text(
                 str(opcao_turno),
                 encoding="utf-8",
@@ -332,6 +386,9 @@ class ArkChessWindow(QMainWindow):
         )
 
     def parar_ark(self):
+        if hasattr(self, "timer_autoplay"):
+            self.timer_autoplay.stop()
+        self._limpar_autoplay_pendente()
         self.overlay.clear_move()
 
         if not self.processo:
@@ -344,6 +401,7 @@ class ArkChessWindow(QMainWindow):
             self.processo.kill()
 
     def backend_finalizado(self, exit_code, _status):
+        self._limpar_autoplay_pendente()
         self.overlay.clear_move()
 
         self.btn_start.setText("▶  INICIAR ARK")
@@ -372,6 +430,9 @@ class ArkChessWindow(QMainWindow):
         if not re.fullmatch(r"[rnbqkpRNBQKP\.\s]+", linha):
             self.log.append(linha)
 
+        # Auto Play V10: usa a confirmação do próprio backend.
+        self._confirmar_autoplay_por_backend(linha)
+
         # V26 informa a região real do board.
         # Exemplo:
         # Região real: {'left': 390, 'top': 147, 'width': 816, 'height': 816}
@@ -384,6 +445,9 @@ class ArkChessWindow(QMainWindow):
             if m:
                 left, top, width, height = map(int, m.groups())
                 size = min(width, height)
+                self.board_left = left
+                self.board_top = top
+                self.board_size = size
                 self.overlay.set_board_geometry(left, top, size)
                 self.log.append(
                     f"Overlay alinhado: {left},{top} • {size}x{size}"
@@ -394,8 +458,9 @@ class ArkChessWindow(QMainWindow):
             if m:
                 cor = m.group(1)
                 self.lbl_cor.setText(f"Sua cor: {cor}")
+                self.white_at_bottom = cor.lower() == "brancas"
                 self.overlay.set_orientation(
-                    white_at_bottom=cor.lower() == "brancas"
+                    white_at_bottom=self.white_at_bottom
                 )
 
         if linha.startswith("Vez:"):
@@ -403,13 +468,16 @@ class ArkChessWindow(QMainWindow):
             self.lbl_turno.setText(f"Vez: {turno}")
 
         if "SUA VEZ" in linha:
+            self.esperando_melhor_jogada = False
             self.lbl_estado.setText("Estado: sua vez")
 
         elif "Aguardando jogada do adversário" in linha:
+            self.esperando_melhor_jogada = False
             self.lbl_estado.setText("Estado: aguardando bot")
             self.overlay.clear_move()
 
         elif "RESET SEGURO concluído" in linha:
+            self.esperando_melhor_jogada = False
             self.status_engine.setText("Sistema ativo")
             self.lbl_estado.setText("Estado: sincronizado")
 
@@ -449,9 +517,279 @@ class ArkChessWindow(QMainWindow):
                 self.lbl_jogada.setText(linha.replace("->", "→"))
                 self.overlay.set_move(origem, destino)
 
+                if self.chk_autoplay.isChecked():
+                    self.executar_autoplay(origem, destino)
+
                 self.esperando_melhor_jogada = False
 
+    def centro_casa(self, casa):
+        """Converte uma casa UCI, como e2, no centro da casa na tela."""
+        if (
+            self.board_left is None
+            or self.board_top is None
+            or self.board_size is None
+        ):
+            return None
+
+        if not re.fullmatch(r"[a-h][1-8]", casa, re.I):
+            return None
+
+        arquivo = ord(casa[0].lower()) - ord("a")
+        rank = int(casa[1]) - 1
+
+        if self.white_at_bottom:
+            coluna = arquivo
+            linha = 7 - rank
+        else:
+            coluna = 7 - arquivo
+            linha = rank
+
+        tamanho_casa = self.board_size / 8.0
+        x = int(self.board_left + (coluna + 0.5) * tamanho_casa)
+        y = int(self.board_top + (linha + 0.5) * tamanho_casa)
+        return x, y
+
+    def executar_autoplay(self, origem, destino):
+        """Agenda a jogada automática somente em estado confirmado."""
+        if self.partida_encerrada:
+            self.log.append("Auto Play: bloqueado porque a partida foi encerrada.")
+            return
+
+        if not self.backend_diz_minha_vez:
+            self.log.append(
+                "Auto Play: lance ignorado porque o backend não confirmou que é nossa vez."
+            )
+            return
+
+        if self.autoplay_em_execucao or self.autoplay_aguardando_confirmacao:
+            self.log.append("Auto Play: já existe uma jogada em andamento.")
+            return
+
+        p_origem = self.centro_casa(origem)
+        p_destino = self.centro_casa(destino)
+
+        if p_origem is None or p_destino is None:
+            self.log.append(
+                "Auto Play: região/orientação do tabuleiro ainda não disponível."
+            )
+            return
+
+        self.autoplay_em_execucao = True
+        self.lbl_estado.setText(
+            f"Estado: Auto Play aguardando {self.autoplay_delay_ms} ms..."
+        )
+        self.log.append(
+            f"Auto Play: jogada {origem} → {destino} agendada "
+            f"após {self.autoplay_delay_ms} ms."
+        )
+
+        try:
+            self.timer_autoplay.timeout.disconnect()
+        except Exception:
+            pass
+
+        self.timer_autoplay.timeout.connect(
+            lambda: self._autoplay_clicar(
+                p_origem, p_destino, origem, destino
+            )
+        )
+        self.timer_autoplay.start(self.autoplay_delay_ms)
+
+
+    def _autoplay_clicar(self, p_origem, p_destino, origem, destino):
+        try:
+            if not self.chk_autoplay.isChecked():
+                return
+
+            if sys.platform != "win32":
+                self.log.append("Auto Play: execução automática disponível no Windows.")
+                return
+
+            user32 = ctypes.windll.user32
+
+            def clique(x, y):
+                user32.SetCursorPos(int(x), int(y))
+                user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
+                user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
+
+            clique(*p_origem)
+
+            QTimer.singleShot(
+                120,
+                lambda: self._autoplay_destino(
+                    p_destino, origem, destino
+                )
+            )
+
+        except Exception as exc:
+            self.log.append(f"Auto Play: erro ao iniciar jogada: {exc}")
+            self.autoplay_em_execucao = False
+
+    def _autoplay_destino(self, p_destino, origem, destino):
+        try:
+            if not self.chk_autoplay.isChecked():
+                return
+
+            user32 = ctypes.windll.user32
+            x, y = p_destino
+            user32.SetCursorPos(int(x), int(y))
+            user32.mouse_event(0x0002, 0, 0, 0, 0)
+            user32.mouse_event(0x0004, 0, 0, 0, 0)
+
+            self.autoplay_jogada_pendente = (origem, destino)
+            self.autoplay_aguardando_confirmacao = True
+            self.backend_diz_minha_vez = False
+            self.ultimo_lance_autoplay = (origem, destino)
+            self.autoplay_reset_tentado = False
+
+            self.log.append(
+                f"Auto Play (treino/bot): {origem} → {destino} • aguardando confirmação"
+            )
+            self.lbl_estado.setText(
+                "Estado: confirmando jogada automática..."
+            )
+
+            # Se o backend não confirmar a mudança, tenta o RESET SEGURO
+            # uma única vez. Não repete o clique da jogada.
+            self.timer_watchdog.stop()
+            self.timer_watchdog.start(self.autoplay_watchdog_ms)
+
+        except Exception as exc:
+            self.log.append(f"Auto Play: erro ao concluir jogada: {exc}")
+            self._limpar_autoplay_pendente()
+
+        finally:
+            self.autoplay_em_execucao = False
+
+    def _limpar_autoplay_pendente(self):
+        if hasattr(self, "timer_watchdog"):
+            self.timer_watchdog.stop()
+        if hasattr(self, "timer_pos_reset"):
+            self.timer_pos_reset.stop()
+
+        self.autoplay_aguardando_confirmacao = False
+        self.autoplay_jogada_pendente = None
+        self.autoplay_reset_tentado = False
+        self.autoplay_em_execucao = False
+
+
+    def _confirmar_autoplay_por_backend(self, linha):
+        """Mantém o Auto Play preso ao estado confirmado pelo backend."""
+        normal = linha.strip().lower()
+
+        # Fim de jogo tem prioridade máxima. Cancela qualquer clique/timer.
+        if (
+            "fim de partida" in normal
+            or "você venceu" in normal
+            or "vitória do adversário" in normal
+            or "empate" in normal
+        ):
+            self.partida_encerrada = True
+            self.backend_diz_minha_vez = False
+            self.esperando_melhor_jogada = False
+            if hasattr(self, "timer_autoplay"):
+                self.timer_autoplay.stop()
+            self._limpar_autoplay_pendente()
+            self.overlay.clear_move()
+            self.lbl_estado.setText("Estado: partida encerrada")
+            self.log.append("■ Auto Play encerrado: fim de partida confirmado.")
+            return
+
+        # Estes eventos significam que o backend confirmou o lance anterior
+        # e agora está esperando o adversário.
+        if "aguardando jogada do adversário" in normal:
+            if self.autoplay_aguardando_confirmacao:
+                jogada = self.autoplay_jogada_pendente
+                if jogada:
+                    self.log.append(
+                        f"✓ Auto Play confirmado: {jogada[0]} → {jogada[1]}"
+                    )
+                self._limpar_autoplay_pendente()
+
+            self.backend_diz_minha_vez = False
+            self.lbl_estado.setText("Estado: aguardando adversário")
+            return
+
+        # Só este evento libera uma NOVA jogada automática.
+        if "sua vez" in normal:
+            self.backend_diz_minha_vez = True
+            self.partida_encerrada = False
+            return
+
+        # Reset/sincronização não é confirmação suficiente para clicar.
+        # Esperamos o backend imprimir explicitamente SUA VEZ ou aguardando adversário.
+        if (
+            "reset seguro concluído" in normal
+            or "sincronização recuperada" in normal
+            or "nova posição confirmada" in normal
+            or "lance ultra confirmado" in normal
+        ):
+            return
+
+
+    def _autoplay_watchdog(self):
+        """Se a jogada não foi confirmada, solicita uma ressincronização segura."""
+        if not self.autoplay_aguardando_confirmacao:
+            return
+
+        if not self.chk_autoplay.isChecked():
+            self._limpar_autoplay_pendente()
+            return
+
+        if (
+            not self.processo
+            or self.processo.state() == QProcess.NotRunning
+        ):
+            self._limpar_autoplay_pendente()
+            return
+
+        if self.autoplay_reset_tentado:
+            return
+
+        self.autoplay_reset_tentado = True
+        self.log.append(
+            "⟳ WATCHDOG: jogada ainda não confirmada. "
+            "Solicitando RESET SEGURO automático..."
+        )
+        self.lbl_estado.setText(
+            "Estado: ressincronizando automaticamente..."
+        )
+
+        # O último estado CONFIRMADO ainda era a nossa vez.
+        # Se a jogada realmente entrou, o backend detectará a transição visual
+        # antes de recorrer a este turno manual.
+        try:
+            RESET_FLAG.unlink(missing_ok=True)
+            RESET_FLAG.write_text("auto", encoding="utf-8")
+            self.log.append("✓ WATCHDOG: pedido de reset gravado.")
+        except Exception as exc:
+            self.log.append(f"ERRO no watchdog: {exc}")
+            self._limpar_autoplay_pendente()
+            return
+
+        # Se nem o reset produzir confirmação, libera o front para não ficar
+        # permanentemente travado. Não repete a jogada automaticamente.
+        self.timer_pos_reset.stop()
+        self.timer_pos_reset.start(7000)
+
+    def _autoplay_pos_reset(self):
+        if not self.autoplay_aguardando_confirmacao:
+            return
+
+        self.log.append(
+            "⚠ WATCHDOG: backend não confirmou o estado após o reset. "
+            "Auto Play permanecerá bloqueado até o backend confirmar de quem é a vez."
+        )
+        self.backend_diz_minha_vez = False
+        self.lbl_estado.setText("Estado: aguardando sincronização")
+        self._limpar_autoplay_pendente()
+
+
+
     def closeEvent(self, event):
+        if hasattr(self, "timer_autoplay"):
+            self.timer_autoplay.stop()
+        self._limpar_autoplay_pendente()
         self.overlay.clear_move()
         self.overlay.close()
 

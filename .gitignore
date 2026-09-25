@@ -29,3 +29,8 @@ stockfish-windows-x86-64-avx2/
 Thumbs.db
 ark_chess.log
 diagnosticos_v25/
+
+# PyInstaller / executavel
+build/
+dist/
+*.spec

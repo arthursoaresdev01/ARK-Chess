@@ -1,43 +1,107 @@
-# ♟️ ARK Chess
+# ARK CoC — Prototype v0.1
 
-O **ARK Chess** é um projeto desenvolvido em Python para análise de partidas de xadrez no Chess.com.
+Protótipo de **copiloto tático para Clash of Clans**, feito em Python.
 
-O sistema utiliza visão computacional para reconhecer o tabuleiro e, com o auxílio do **Stockfish**, analisar a posição e sugerir a melhor jogada.
+Ele NÃO clica no jogo e NÃO executa ataques automaticamente. O objetivo é:
+1. ler uma screenshot;
+2. delimitar a área jogável;
+3. detectar construções quando houver um YOLO CoC treinado;
+4. enquanto o modelo ainda não existe, usar candidatos geométricos;
+5. avaliar 16 ângulos de entrada;
+6. estimar layout, core, funil e rota;
+7. salvar uma imagem anotada e um JSON com o plano.
 
-## 🚀 Funcionalidades
+## Estrutura
 
-Atualmente, o ARK Chess conta com:
+```text
+ARK_CoC_Prototype/
+├─ main.py
+├─ requirements.txt
+├─ base_exemplo.png
+├─ arkcoc/
+│  ├─ geometry.py
+│  ├─ vision.py
+│  ├─ tactics.py
+│  ├─ overlay.py
+│  ├─ models.py
+│  └─ io_utils.py
+├─ data/
+│  └─ knowledge_2026_09.json
+├─ models/
+│  └─ ark_coc.pt   <- entra aqui no futuro
+└─ saida/
+```
 
-- 🖥️ **Interface gráfica** para acompanhar o funcionamento do sistema e as sugestões de jogadas.
-- 👁️ **Reconhecimento automático do tabuleiro** através de visão computacional.
-- 🧠 **Análise com Stockfish** para encontrar os melhores lances da posição.
-- 🎯 **Overlay em tempo real**, indicando visualmente qual peça deve ser movimentada e para qual casa.
-- ♟️ **Identificação dos movimentos**, acompanhando as alterações realizadas no tabuleiro.
-- 🔄 **Sincronização da partida**, permitindo que o ARK acompanhe o estado atual do jogo.
-- ⚡ **Fast-Track**, desenvolvido para detectar movimentos rapidamente sem depender de uma nova análise completa do tabuleiro a cada lance.
+## Instalação
 
-## 🛠️ Tecnologias utilizadas
+No PowerShell, dentro da pasta do projeto:
 
-- Python
-- PySide6
-- OpenCV
-- YOLO / Ultralytics
-- Stockfish
-- python-chess
-- MSS
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
 
-## 📌 Estado do projeto
+## Rodar com sua base
 
-O ARK Chess está atualmente em sua **primeira versão funcional**.
+Coloque a screenshot como `base.png` e rode:
 
-O projeto continua em desenvolvimento, com foco em melhorar a velocidade de inicialização, precisão do reconhecimento das peças, estabilidade e experiência da interface.
+```powershell
+python main.py --image base.png --army ranked_adaptive --show
+```
 
-## 🎓 Objetivo
+Ou use a imagem de exemplo:
 
-O ARK Chess foi desenvolvido como um projeto de estudo envolvendo:
+```powershell
+python main.py --image base_exemplo.png --army ranked_adaptive --show
+```
 
-**Python • Inteligência Artificial • Visãputacionao Coml • Xadrez • Desenvolvimento de Software**
+Outros perfis:
 
-O objetivo é explorar a integração entre reconhecimento visual, motores de xadrez e interfaces gráficas para análise e treinamento.
+```powershell
+python main.py --image base.png --army dragons --show
+python main.py --image base.png --army cyclopes_healers --show
+python main.py --image base.png --army ground_smash --show
+```
 
- Criador: ARTHUR SOARES
+## O que já funciona
+
+- máscara geométrica da área jogável;
+- detector fallback por OpenCV;
+- suporte pronto para `models/ark_coc.pt`;
+- mapa de objetos;
+- core ponderado;
+- classificação básica do layout;
+- 16 candidatos de entrada;
+- pontuação de densidade, acesso ao core, risco e funil;
+- recomendação de entrada;
+- pontos de funil A/B;
+- rota até o core;
+- overlay visual;
+- `saida/analise.png`;
+- `saida/plano.json`.
+
+## Limitação principal atual
+
+Sem um **YOLO treinado especificamente em construções do CoC**, o programa não sabe se um objeto é CV, Inferno, Monólito etc.
+
+O fallback atual encontra apenas regiões visualmente densas. Por isso a arquitetura está pronta, mas a inteligência estratégica ainda trabalha com informação incompleta.
+
+A melhoria que mais aumenta a qualidade agora é o dataset/modelo `ark_coc.pt`.
+
+## Próxima evolução planejada
+
+### V0.2 — detector real
+Treinar YOLO com classes prioritárias de defesas e CV.
+
+### V0.3 — threat map
+Usar classe, alcance, prioridade e sinergias das defesas para criar um mapa de risco.
+
+### V0.4 — pathing
+Criar grafo de construções/compartimentos e simular caminhos prováveis do exército.
+
+### V0.5 — ranked
+Ler a base quando ela aparece e, dado um exército já escolhido, recomendar entrada e execução.
+
+### V0.6 — aprendizado pós-ataque
+Registrar previsão vs. resultado para calibrar pesos do sistema.
